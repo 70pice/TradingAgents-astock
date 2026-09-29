@@ -237,7 +237,11 @@ class TradingAgentsGraph:
         # 启动时就校验，而不是留到运行中。
         _fb_provider = self.config.get("agent_sdk_fallback_provider")
         _fb_model = self.config.get("agent_sdk_fallback_model")
-        if (deep_on or quick_on) and bool(_fb_provider) != bool(_fb_model):
+        codex_fallback = str(_fb_provider or "").strip().lower() == "codex_cli"
+        if (deep_on or quick_on) and (
+            (not _fb_provider and bool(_fb_model))
+            or (bool(_fb_provider) and not _fb_model and not codex_fallback)
+        ):
             missing = "agent_sdk_fallback_model" if _fb_provider else "agent_sdk_fallback_provider"
             given = "agent_sdk_fallback_provider" if _fb_provider else "agent_sdk_fallback_model"
             raise ValueError(
@@ -265,7 +269,8 @@ class TradingAgentsGraph:
                 _fb_effective = _fb_norm or _main_norm
                 fallback_spec = {
                     "provider": _fb_effective,
-                    "model": _fb_model or self.config[fallback_model_key],
+                    "model": (str(_fb_model or "").strip() if codex_fallback
+                              else _fb_model or self.config[fallback_model_key]),
                     "base_url": None if cross_provider else self.config.get("backend_url"),
                     # 带上 callbacks：降级意味着**开始计费**，此时统计/成本回调
                     # 反而看不到这些调用的话，恰好在花钱的时候统计是瞎的。

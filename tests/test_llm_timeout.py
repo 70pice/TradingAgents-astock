@@ -415,6 +415,17 @@ class TestResilienceFollowsTargetProvider:
         assert spec["reasoning_effort"] == "high"
         assert spec["timeout"] == 42
 
+    @pytest.mark.parametrize("model", [None, ""])
+    def test_explicit_codex_fallback_accepts_default_model(self, tmp_path, model):
+        _, spec = _build_graph(tmp_path, {
+            "llm_provider": "deepseek",
+            "deep_think_provider_override": "claude_agent_sdk",
+            "agent_sdk_fallback_provider": "codex_cli",
+            "agent_sdk_fallback_model": model,
+        })
+        assert spec["provider"] == "codex_cli"
+        assert spec["model"] == ""
+
     def test_fallback_provider_spelling_does_not_change_behaviour(self, tmp_path):
         # 全仓唯一一处**没有** .lower() 的 provider 比较就在这儿：写成 "DeepSeek"
         # 时同一家被判成跨厂商 ⇒ backend_url 被扔掉，降级请求发去官方默认端点

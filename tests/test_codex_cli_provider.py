@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
+import signal
 import sys
 import time
 
@@ -121,10 +121,10 @@ def test_chatgpt_mode_clears_api_credentials_and_rejects_wrong_login(monkeypatch
     def fake_run(args, **kwargs):
         if args[1:3] == ["features", "list"]:
             output = "\n".join(f"{name} stable false" for name in codex._REQUIRED_DISABLED_FEATURES)
-            return subprocess.CompletedProcess(args, 0, output, "")
-        return subprocess.CompletedProcess(args, 0, "Logged in using API key", "")
+            return 0, output, ""
+        return 0, "Logged in using API key", ""
 
-    monkeypatch.setattr(codex.subprocess, "run", fake_run)
+    monkeypatch.setattr(codex, "_run_process", fake_run)
     with pytest.raises(codex.CodexCLIAuthError, match="API key"):
         client._preflight()
 
@@ -179,6 +179,75 @@ def test_process_early_exit_reports_return_code_without_broken_pipe(tmp_path):
     )
     assert code == 3
     assert stdout == stderr == ""
+
+
+@pytest.mark.unit
+def test_process_rejects_truncated_stdout_after_an_earlier_final(tmp_path):
+    script = (
+        "import json,sys; "
+        "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'old'}})); "
+        "sys.stdout.write('x' * 1100000)"
+    )
+    with pytest.raises(codex.CodexCLIError, match="stdout exceeded the output limit"):
+        codex._run_process(
+            [sys.executable, "-c", script], prompt="", cwd=str(tmp_path),
+            env=dict(os.environ), timeout=3,
+        )
+
+
+@pytest.mark.unit
+def test_chatgpt_login_is_checked_again_before_later_requests(monkeypatch):
+    client = codex.CodexCLIClient("", auth_mode="chatgpt")
+    checks = []
+
+    def fake_run(args, **kwargs):
+        checks.append(args[1:3])
+        if args[1:3] == ["features", "list"]:
+            return 0, "\n".join(f"{name} stable false" for name in codex._REQUIRED_DISABLED_FEATURES), ""
+        status = "Logged in using ChatGPT" if checks.count(["login", "status"]) == 1 else "Logged in using API key"
+        return 0, status, ""
+
+    monkeypatch.setattr(codex, "_run_process", fake_run)
+    client._preflight()
+    with pytest.raises(codex.CodexCLIAuthError, match="API key"):
+        client._preflight()
+    assert checks.count(["features", "list"]) == 1
+    assert checks.count(["login", "status"]) == 2
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(os.name != "posix", reason="Process-group cleanup uses POSIX signals")
+def test_preflight_timeout_stops_child_process(tmp_path):
+    marker = tmp_path / "heartbeat"
+    pid_file = tmp_path / "child-pid"
+    child_code = (
+        "import sys,time; from pathlib import Path; p=Path(sys.argv[1]);\n"
+        "while True:\n p.write_text(str(time.time())); time.sleep(0.02)"
+    )
+    parent_code = (
+        "import subprocess,sys,time; from pathlib import Path; "
+        "p=Path(sys.argv[1]); pid=Path(sys.argv[2]); "
+        f"child=subprocess.Popen([sys.executable,'-c',{child_code!r},str(p)]); "
+        "pid.write_text(str(child.pid));\n"
+        "while not p.exists(): time.sleep(0.01)\n"
+        "time.sleep(30)"
+    )
+    client = codex.CodexCLIClient("", timeout=0.5)
+    try:
+        with pytest.raises(codex.CodexCLIError, match="exceeded the configured timeout"):
+            client._run_preflight_command(
+                [sys.executable, "-c", parent_code, str(marker), str(pid_file)],
+                client._environment(),
+            )
+        before = marker.read_text()
+        time.sleep(0.15)
+        assert marker.read_text() == before
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 @pytest.mark.unit

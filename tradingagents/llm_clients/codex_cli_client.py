@@ -112,7 +112,7 @@ def _serialize_messages(prompt: Any) -> str:
     return json.dumps(history, ensure_ascii=False, separators=(",", ":"))
 
 
-def _read_capped(pipe, limit: int, bucket: list[bytes]) -> None:
+def _read_capped(pipe, limit: int, bucket: list[bytes], overflow: threading.Event) -> None:
     total = 0
     while True:
         chunk = pipe.read(8192)
@@ -122,6 +122,8 @@ def _read_capped(pipe, limit: int, bucket: list[bytes]) -> None:
         if remaining > 0:
             bucket.append(chunk[:remaining])
             total += min(len(chunk), remaining)
+        if len(chunk) > remaining:
+            overflow.set()
 
 
 def _run_process(args: list[str], *, prompt: str, cwd: str,
@@ -141,9 +143,11 @@ def _run_process(args: list[str], *, prompt: str, cwd: str,
 
     stdout_parts: list[bytes] = []
     stderr_parts: list[bytes] = []
+    stdout_overflow = threading.Event()
+    stderr_overflow = threading.Event()
     readers = [
-        threading.Thread(target=_read_capped, args=(process.stdout, _OUTPUT_LIMIT, stdout_parts), daemon=True),
-        threading.Thread(target=_read_capped, args=(process.stderr, _ERROR_LIMIT, stderr_parts), daemon=True),
+        threading.Thread(target=_read_capped, args=(process.stdout, _OUTPUT_LIMIT, stdout_parts, stdout_overflow), daemon=True),
+        threading.Thread(target=_read_capped, args=(process.stderr, _ERROR_LIMIT, stderr_parts, stderr_overflow), daemon=True),
     ]
     for reader in readers:
         reader.start()
@@ -188,6 +192,10 @@ def _run_process(args: list[str], *, prompt: str, cwd: str,
             writer.join(timeout=2)
     for reader in readers:
         reader.join(timeout=2)
+    if stdout_overflow.is_set():
+        raise CodexCLIError("Codex CLI stdout exceeded the output limit; the response was discarded.")
+    if stderr_overflow.is_set():
+        raise CodexCLIError("Codex CLI stderr exceeded the output limit; the response was discarded.")
     if write_errors and return_code == 0:
         raise CodexCLIError("Could not send the request to Codex CLI.")
     stdout = b"".join(stdout_parts).decode("utf-8", errors="replace")
@@ -465,7 +473,7 @@ class CodexCLIClient(BaseLLMClient):
         if self.timeout <= 0:
             self.timeout = 150.0
         self.reasoning_effort = reasoning_effort
-        self._preflight_done = False
+        self._features_checked = False
         self._usage_local = threading.local()
 
     def get_llm(self) -> CodexCLIChatModel:
@@ -527,47 +535,34 @@ class CodexCLIClient(BaseLLMClient):
                 logger.debug("codex_cli callback failed", exc_info=True)
 
     def _preflight(self) -> None:
-        if self._preflight_done:
-            return
         env = self._environment()
-        try:
-            features = subprocess.run(
-                [self.cli_path, "features", "list"], capture_output=True, text=True,
-                timeout=min(10.0, self.timeout), check=False, shell=False, env=env,
+        if not self._features_checked:
+            features_code, features_stdout, _ = self._run_preflight_command(
+                [self.cli_path, "features", "list"], env
             )
-        except FileNotFoundError as exc:
-            raise CodexCLIError("Codex CLI was not found. Install it or set CODEX_CLI_PATH.") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise CodexCLIError("Timed out while checking Codex CLI capabilities.") from exc
-        available_features = {
-            line.split()[0]
-            for line in features.stdout.splitlines()
-            if line.split()
-        }
-        missing_features = _REQUIRED_DISABLED_FEATURES - available_features
-        if features.returncode != 0 or missing_features:
-            raise CodexCLIError(
-                "This Codex CLI lacks required tool-disable flags for safe provider use "
-                f"({', '.join(sorted(missing_features)) or 'features list failed'}). Upgrade Codex CLI and retry."
-            )
+            available_features = {
+                line.split()[0]
+                for line in features_stdout.splitlines()
+                if line.split()
+            }
+            missing_features = _REQUIRED_DISABLED_FEATURES - available_features
+            if features_code != 0 or missing_features:
+                raise CodexCLIError(
+                    "This Codex CLI lacks required tool-disable flags for safe provider use "
+                    f"({', '.join(sorted(missing_features)) or 'features list failed'}). Upgrade Codex CLI and retry."
+                )
+            self._features_checked = True
 
         if self.auth_mode == "api_key":
-            self._preflight_done = True
             return
 
-        try:
-            result = subprocess.run(
-                [self.cli_path, "login", "status"], capture_output=True, text=True,
-                timeout=min(10.0, self.timeout), check=False, shell=False, env=env,
-            )
-        except FileNotFoundError as exc:
-            raise CodexCLIError("Codex CLI was not found. Install it or set CODEX_CLI_PATH.") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise CodexCLIError("Timed out while checking Codex CLI authentication.") from exc
-        status = (result.stdout + "\n" + result.stderr).strip()
+        status_code, status_stdout, status_stderr = self._run_preflight_command(
+            [self.cli_path, "login", "status"], env
+        )
+        status = (status_stdout + "\n" + status_stderr).strip()
         lower = status.lower()
         if self.auth_mode == "chatgpt":
-            if result.returncode != 0 or "logged in using chatgpt" not in lower:
+            if status_code != 0 or "logged in using chatgpt" not in lower:
                 if "api key" in lower:
                     raise CodexCLIAuthError(
                         "Codex is logged in with an API key, but ChatGPT login mode was selected. "
@@ -576,10 +571,14 @@ class CodexCLIClient(BaseLLMClient):
                 raise CodexCLIAuthError(
                     "Codex ChatGPT login is unavailable. Run `codex login` and verify with `codex login status`."
                 )
-        else:
-            if result.returncode != 0 and not self.api_key and not os.getenv("OPENAI_API_KEY"):
-                raise CodexCLIAuthError("Codex API key authentication is unavailable.")
-        self._preflight_done = True
+
+    def _run_preflight_command(self, args: list[str], env: dict[str, str]) -> tuple[int, str, str]:
+        # Apply the same process-group timeout/cleanup as the main Codex call.
+        with tempfile.TemporaryDirectory(prefix="tradingagents-codex-check-") as temp_dir:
+            return _run_process(
+                args, prompt="", cwd=temp_dir, env=env,
+                timeout=min(10.0, self.timeout),
+            )
 
     def _invoke_text(self, prompt: Any, output_schema: Optional[dict] = None) -> str:
         self._preflight()
