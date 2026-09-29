@@ -55,6 +55,10 @@ def _load_saved_llm_config() -> None:
     )
     if cfg.get("agent_sdk_model"):
         st.session_state.setdefault("agent_sdk_model", cfg["agent_sdk_model"])
+    st.session_state.setdefault("codex_cli_auth_mode", cfg.get("codex_cli_auth_mode", "chatgpt"))
+    st.session_state.setdefault("codex_cli_path", cfg.get("codex_cli_path", ""))
+    st.session_state.setdefault("codex_cli_quick_model", cfg.get("codex_cli_quick_model", ""))
+    st.session_state.setdefault("codex_cli_deep_model", cfg.get("codex_cli_deep_model", ""))
     for key in ("custom_quick_model", "custom_deep_model"):
         if key in cfg and cfg[key]:
             st.session_state.setdefault(key, cfg[key])
@@ -68,6 +72,10 @@ def _save_llm_config() -> None:
         "deep_model_idx": st.session_state.get("deep_model_idx", 0),
         "llm_base_url": st.session_state.get("llm_base_url", ""),
         "subscription_scope": st.session_state.get("subscription_scope", "off"),
+        "codex_cli_auth_mode": st.session_state.get("codex_cli_auth_mode", "chatgpt"),
+        "codex_cli_path": st.session_state.get("codex_cli_path", ""),
+        "codex_cli_quick_model": st.session_state.get("codex_cli_quick_model", ""),
+        "codex_cli_deep_model": st.session_state.get("codex_cli_deep_model", ""),
     }
     if st.session_state.get("agent_sdk_model"):
         cfg["agent_sdk_model"] = st.session_state["agent_sdk_model"]
@@ -90,6 +98,7 @@ _PROVIDERS: list[tuple[str, str]] = [
     ("通义千问 Qwen", "qwen"),
     ("智谱 GLM", "glm"),
     ("OpenAI", "openai"),
+    ("Codex CLI（本机 Codex 登录）", "codex_cli"),
     ("Anthropic", "anthropic"),
     ("Google Gemini", "google"),
     ("xAI Grok", "xai"),
@@ -211,7 +220,20 @@ def _render_llm_config() -> None:
     provider_key = _PROVIDER_KEYS[provider_idx]
     st.session_state["llm_provider"] = provider_key
 
-    if provider_key in MODEL_OPTIONS:
+    if provider_key == "codex_cli":
+        quick_model = st.text_input(
+            "快速思考 Codex CLI 模型 ID（留空使用默认模型）",
+            key="codex_cli_quick_model",
+            placeholder="留空使用 Codex CLI 默认模型",
+        )
+        deep_model = st.text_input(
+            "深度思考 Codex CLI 模型 ID（留空使用默认模型）",
+            key="codex_cli_deep_model",
+            placeholder="留空使用 Codex CLI 默认模型",
+        )
+        st.session_state["quick_think_llm"] = quick_model.strip()
+        st.session_state["deep_think_llm"] = deep_model.strip()
+    elif provider_key in MODEL_OPTIONS:
         quick_options = MODEL_OPTIONS[provider_key]["quick"]
         deep_options = MODEL_OPTIONS[provider_key]["deep"]
 
@@ -243,26 +265,43 @@ def _render_llm_config() -> None:
         st.session_state["quick_think_llm"] = custom_quick
         st.session_state["deep_think_llm"] = custom_deep
 
-    base_url_required = provider_key == "openai_compatible"
-    st.text_input(
-        "API Base URL（第三方/代理" + ("·必填" if base_url_required else "，可选") + "）",
-        key="llm_base_url",
-        placeholder="例: https://your-relay.example/v1",
-        help=(
-            "通过第三方中转/代理访问模型时填写网关地址；留空则用所选供应商的官方地址。"
-            "API Key 仍从 .env 读取，每个供应商用各自的环境变量——"
-            "OpenAI=OPENAI_API_KEY、DeepSeek=DEEPSEEK_API_KEY、"
-            "通义=DASHSCOPE_API_KEY、智谱=ZHIPU_API_KEY、MiniMax=MINIMAX_API_KEY、"
-            "Claude=ANTHROPIC_API_KEY、OpenRouter=OPENROUTER_API_KEY、xAI=XAI_API_KEY、"
-            "OpenAI 兼容（自定义）=OPENAI_COMPATIBLE_API_KEY（也接受 OPENAI_API_KEY）。"
-            "也可在 .env 里设 BACKEND_URL 代替此处。"
-        ),
-    )
-    if base_url_required:
-        st.caption(
-            "已选「OpenAI 兼容（自定义）」：**Base URL 必填**（你的网关，走标准 Chat "
-            "Completions），模型 ID 手动填写，Key 在 .env 设 `OPENAI_COMPATIBLE_API_KEY`。"
+    if provider_key != "codex_cli":
+        base_url_required = provider_key == "openai_compatible"
+        st.text_input(
+            "API Base URL（第三方/代理" + ("·必填" if base_url_required else "，可选") + "）",
+            key="llm_base_url",
+            placeholder="例: https://your-relay.example/v1",
+            help=(
+                "通过第三方中转/代理访问模型时填写网关地址；留空则用所选供应商的官方地址。"
+                "API Key 仍从 .env 读取，每个供应商用各自的环境变量——"
+                "OpenAI=OPENAI_API_KEY、DeepSeek=DEEPSEEK_API_KEY、"
+                "通义=DASHSCOPE_API_KEY、智谱=ZHIPU_API_KEY、MiniMax=MINIMAX_API_KEY、"
+                "Claude=ANTHROPIC_API_KEY、OpenRouter=OPENROUTER_API_KEY、xAI=XAI_API_KEY、"
+                "OpenAI 兼容（自定义）=OPENAI_COMPATIBLE_API_KEY（也接受 OPENAI_API_KEY）。"
+                "也可在 .env 里设 BACKEND_URL 代替此处。"
+            ),
         )
+        if base_url_required:
+            st.caption(
+                "已选「OpenAI 兼容（自定义）」：**Base URL 必填**（你的网关，走标准 Chat "
+                "Completions），模型 ID 手动填写，Key 在 .env 设 `OPENAI_COMPATIBLE_API_KEY`。"
+            )
+    else:
+        auth_mode = st.selectbox(
+            "Codex CLI 认证方式",
+            options=["chatgpt", "api_key"],
+            format_func=lambda value: (
+                "ChatGPT 登录 / 订阅额度" if value == "chatgpt"
+                else "OpenAI API Key / 按 API 用量计费"
+            ),
+            key="codex_cli_auth_mode",
+            help="ChatGPT 模式使用本机 `codex login` 会话。API Key 模式只在明确选择后读取 CODEX_API_KEY 或 OPENAI_API_KEY，并按 API 计费。",
+        )
+        if auth_mode == "chatgpt":
+            st.caption("运行前核验 `codex login status` 必须显示 ChatGPT 登录；认证失败时停止，不会改用 OpenAI API。")
+        else:
+            st.caption("此模式会产生 OpenAI API 费用。请在环境变量 `CODEX_API_KEY` 或 `OPENAI_API_KEY` 中配置 Key；Key 不会写入配置文件。")
+        st.text_input("Codex CLI 可执行文件（留空则查找 PATH）", key="codex_cli_path", placeholder="codex")
 
     # ── 个人 Claude 订阅额度（可选，仅个人自用）────────────────────────
     _scope_labels = [

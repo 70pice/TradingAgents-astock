@@ -48,6 +48,34 @@ def test_save_creates_parent_dir_and_roundtrips_scope(fake_st):
 
 
 @pytest.mark.unit
+def test_codex_cli_auth_settings_roundtrip_without_saving_api_key(fake_st):
+    fake_st.session_state.update({
+        "llm_provider": "codex_cli",
+        "codex_cli_auth_mode": "api_key",
+        "codex_cli_path": "/usr/local/bin/codex",
+        "codex_cli_quick_model": "gpt-6-luna",
+        "codex_cli_deep_model": "gpt-6-sol",
+        "OPENAI_API_KEY": "must-not-persist",
+    })
+    sidebar._save_llm_config()
+    saved = json.loads(sidebar._LLM_CONFIG_PATH.read_text())
+    assert saved["llm_provider"] == "codex_cli"
+    assert saved["codex_cli_auth_mode"] == "api_key"
+    assert saved["codex_cli_path"] == "/usr/local/bin/codex"
+    assert saved["codex_cli_quick_model"] == "gpt-6-luna"
+    assert saved["codex_cli_deep_model"] == "gpt-6-sol"
+    assert "OPENAI_API_KEY" not in saved
+
+    fake_st.session_state.clear()
+    sidebar._load_saved_llm_config()
+    assert fake_st.session_state["llm_provider_idx"] == sidebar._PROVIDER_KEYS.index("codex_cli")
+    assert fake_st.session_state["codex_cli_auth_mode"] == "api_key"
+    assert fake_st.session_state["codex_cli_path"] == "/usr/local/bin/codex"
+    assert fake_st.session_state["codex_cli_quick_model"] == "gpt-6-luna"
+    assert fake_st.session_state["codex_cli_deep_model"] == "gpt-6-sol"
+
+
+@pytest.mark.unit
 def test_load_does_not_override_in_session_choice(fake_st):
     sidebar._LLM_CONFIG_PATH.parent.mkdir(parents=True)
     sidebar._LLM_CONFIG_PATH.write_text(json.dumps({"llm_provider": "openai", "subscription_scope": "all"}))

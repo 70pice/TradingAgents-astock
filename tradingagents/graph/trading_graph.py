@@ -73,6 +73,7 @@ _PROVIDER_SPECIFIC_KWARGS = frozenset({
     "reasoning_effort",   # openai
     "thinking_level",     # google
     "effort",             # anthropic
+    "codex_cli_path", "codex_cli_auth_mode", "codex_cli_reasoning_effort",
 })
 
 # 超时与重试三件套：由 `_resilience_kwargs()` 统一产出，也由它统一覆盖。
@@ -280,6 +281,11 @@ class TradingAgentsGraph:
                     # 挂死会恰好在最需要它工作的时候原样复现。
                     # 判据按 `_fb_effective`（真正的目标）算，不是按 llm_provider。
                     **self._resilience_kwargs(_fb_effective),
+                    **({
+                        "cli_path": self.config.get("codex_cli_path"),
+                        "auth_mode": self.config.get("codex_cli_auth_mode", "chatgpt"),
+                        "reasoning_effort": self.config.get("codex_cli_reasoning_effort"),
+                    } if _fb_effective == "codex_cli" else {}),
                 }
                 return create_llm_client(
                     provider="claude_agent_sdk",
@@ -395,7 +401,7 @@ class TradingAgentsGraph:
         cache: Dict[tuple, Any] = {}
         resolved: Dict[str, Any] = {}
         for role, spec in specs.items():
-            if not isinstance(spec, dict) or not spec.get("model"):
+            if not isinstance(spec, dict):
                 raise ValueError(
                     f"role_llms['{role}'] 必须是带 model 的字典，"
                     f'例如 {{"provider": "deepseek", "model": "deepseek-chat"}}。'
@@ -406,6 +412,11 @@ class TradingAgentsGraph:
             # —— 必须用**同一个**归一化结果，否则会出现"这处算同一家、那处算跨厂商"。
             # 口径与 factory.create_llm_client 一致：strip().lower()。
             provider_norm = provider.strip().lower()
+            model_name = spec.get("model") or ""
+            if not model_name and provider_norm != "codex_cli":
+                raise ValueError(
+                    f"role_llms['{role}'] 必须是带 model 的字典；只有 codex_cli 可留空以使用 CLI 默认模型。"
+                )
             main_norm = str(main_provider or "").strip().lower()
             # backend_url 是给主 provider 配的端点。换了厂商还把它带过去，请求就会
             # 发到另一家的网关（和 agent_sdk 降级那里同一个坑）。None = 用该
@@ -438,14 +449,21 @@ class TradingAgentsGraph:
                 role_kwargs.pop(key, None)
             role_kwargs.update(self._resilience_kwargs(provider_norm))
 
-            key = (provider_norm, spec["model"], base_url, spec.get("api_key"))
+            if provider_norm == "codex_cli":
+                role_kwargs.update({
+                    "cli_path": self.config.get("codex_cli_path"),
+                    "auth_mode": self.config.get("codex_cli_auth_mode", "chatgpt"),
+                    "reasoning_effort": self.config.get("codex_cli_reasoning_effort"),
+                })
+
+            key = (provider_norm, model_name, base_url, spec.get("api_key"))
             if key not in cache:
                 client_kwargs = dict(role_kwargs)
                 if spec.get("api_key"):
                     client_kwargs["api_key"] = spec["api_key"]
                 cache[key] = create_llm_client(
                     provider=provider,
-                    model=spec["model"],
+                    model=model_name,
                     base_url=base_url,
                     **client_kwargs,
                 ).get_llm()
@@ -519,6 +537,13 @@ class TradingAgentsGraph:
             effort = self.config.get("anthropic_effort")
             if effort:
                 kwargs["effort"] = effort
+
+        elif provider == "codex_cli":
+            kwargs.update({
+                "cli_path": self.config.get("codex_cli_path"),
+                "auth_mode": self.config.get("codex_cli_auth_mode", "chatgpt"),
+                "reasoning_effort": self.config.get("codex_cli_reasoning_effort"),
+            })
 
         return kwargs
 
